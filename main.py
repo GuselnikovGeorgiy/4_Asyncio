@@ -8,7 +8,7 @@ import pandas as pd
 from fake_useragent import UserAgent
 from time import time
 
-from database import create_tables, save
+from database import create_tables, async_session_maker
 from model import SpimexTradingResults
 
 BASE_URL = "https://spimex.com"
@@ -16,50 +16,71 @@ BASE_URL = "https://spimex.com"
 
 async def main() -> None:
     await create_tables()
-    await get_tasks_reports()
+    reports = await get_reports()
+    print(len(reports), type(reports))
+    for report in reports:
+        if report is not None:
+            await save_to_db(report[0], report[1])
 
 
-async def get_tasks_reports() -> None:
+async def get_reports():
     report_date = datetime.now().date()
-    tasks = []
     async with aiohttp.ClientSession() as session:
-        while report_date.year > 2023:
+        tasks = []
+
+        while report_date > datetime(2024, 1, 1).date():
             date_str = report_date.strftime('%Y%m%d')
             url = f"{BASE_URL}/upload/reports/oil_xls/oil_xls_{date_str}162000.xls"
             tasks.append(process_report(session, url, report_date))
             report_date -= timedelta(days=1)
-        await asyncio.gather(*tasks)
+        return await asyncio.gather(*tasks)
 
 
-async def process_report(session: aiohttp.ClientSession, url: str, report_date: date) -> None:
-    async with session.get(url, headers={"User-Agent": UserAgent().chrome}) as response:
-        if response.status == 200:
+async def process_report(session: aiohttp.ClientSession, url: str, report_date: date) -> (pd.DataFrame, date):
+    retries = 5     # Максимальное количество повторных попыток
+    delay = 2       # Задержка между попытками
 
-            print(f"Downloaded report for {report_date}")
+    for attempt in range(retries):
+        try:
+            async with session.get(url, headers={"User-Agent": UserAgent().random}) as response:
+                if response.status == 200:
 
-            data: bytes = await response.read()
+                    print(f"Downloaded report for {report_date}")
 
-            start_marker = "Единица измерения: Метрическая тонна"
-            end_marker = "Итого:"
+                    data: bytes = await response.read()
 
-            with pd.ExcelFile(BytesIO(data)) as xls:
-                excel_data = pd.read_excel(xls, header=None)
-                try:
-                    start_row = excel_data.loc[excel_data.eq(start_marker).any(axis=1)].index[0] + 3
-                    end_row = excel_data.loc[excel_data.eq(end_marker).any(axis=1)].index[0]
-                except IndexError:
-                    raise Exception(f"Report for {report_date} not found")
+                    start_marker = "Единица измерения: Метрическая тонна"
+                    end_marker = "Итого:"
 
-            report_data = excel_data[start_row:end_row]
-            report_data = report_data.drop(report_data.columns[0], axis=1)
-            report_data = report_data[report_data.iloc[:, -1] != "-"]
-            print(f"Processed report for {report_date}")
+                    excel_data = pd.read_excel(BytesIO(data), header=None)
+                    try:
+                        excel_data = excel_data.drop(excel_data.columns[0], axis=1)
+                        start_row = excel_data[excel_data.eq(start_marker).any(axis=1)].index[0] + 3
+                        end_rows = excel_data[excel_data.eq(end_marker).any(axis=1)].index
+                        end_row = end_rows[end_rows > start_row][0]
+                        excel_data = excel_data[start_row:end_row]
+                        excel_data = excel_data[excel_data.iloc[:, -1] != "-"]
+                        if excel_data.empty:
+                            raise
+                    except IndexError:
+                        raise Exception(f"Error with report {report_date}")
 
-            await save_to_db(report_data, report_date)
+                    print(f"Processed report for {report_date}")
+
+                    return excel_data, report_date
+
+        except (aiohttp.ClientError, Exception) as e:
+            print(f"Attempt {attempt + 1} failed for {report_date}: {e}")
+            if attempt < retries - 1:
+                await asyncio.sleep(delay)
+            else:
+                print(f"Giving up on report for {report_date} after {retries} attempts")
 
 
 async def save_to_db(report: pd.DataFrame, report_date: date) -> None:
     print(f"Saving to DB report for {report_date}")
+    if report.empty:
+        return
     records = []
     try:
         for _, row in report.iterrows():
@@ -77,7 +98,15 @@ async def save_to_db(report: pd.DataFrame, report_date: date) -> None:
             ))
     except Exception as e:
         print(e)
-    await save(records)
+
+    async with async_session_maker() as session:
+        try:
+            async with session.begin():
+                session.add_all(records)
+            await session.commit()
+        except Exception as e:
+            print(e)
+            await session.rollback()
 
 
 if __name__ == "__main__":
